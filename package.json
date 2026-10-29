@@ -1,0 +1,18 @@
+{
+  "name": "labelflow",
+  "version": "1.1.0",
+  "description": "Standalone local-first browser image annotation tool; Node required only for development tests and archived server.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/browser-core.test.js test/local-backend.test.js test/coco-area-fix.test.js test/export-audit.test.js test/ui-beta-notice.test.js test/ui-image-recovery.test.js test/editor-image-layer.test.js test/script-loading.test.js",
+    "test:legacy": "node --test test/regression.test.js"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "dependencies": {
+    "bmp-js": "0.1.0",
+    "sharp": "0.35.5"
+  }
+}

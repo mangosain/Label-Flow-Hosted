@@ -1,0 +1,517 @@
+"use strict";
+/**
+ * LabelFlow (user) app. Flow: join with a name -> claim an unclaimed page ->
+ * annotate -> SAVE (manual sync to the admin-side store) -> Save & Complete
+ * unlocks the next claim. Work is NOT autosaved: the Save button is the
+ * sync point (by design), and leaving with unsaved changes warns.
+ */
+
+const TOKEN_KEY = "labeler_identity";
+const $ = (sel) => document.querySelector(sel);
+const app = $("#app");
+const escAttr = window.lfEscapeHTML;
+const escHtml = window.lfEscapeHTML;
+
+let identity = null; // {token, user:{id,name}}
+let project = null;
+let labels = [];
+let currentImage = null;
+let canvas = null;
+
+// Tool switching lives here (module scope, added once) so it works whether
+// triggered by a button click or a global keyboard shortcut, and so we only
+// ever attach ONE keydown listener for the app's lifetime (attaching this
+// inside renderWorkspace() would stack a new listener on every image).
+function selectTool(name) {
+  if (!canvas) return;
+  // "line-lasso" has no [data-tool] button of its own -- it's driven by the
+  // "Line annotation" checkbox instead -- so the button lookup below is
+  // allowed to come up empty; every OTHER tool still has a real button.
+  document.querySelectorAll("[data-tool]").forEach((x) => x.classList.remove("active"));
+  const btn = document.querySelector(`[data-tool="${name}"]`);
+  if (btn) btn.classList.add("active");
+  canvas.setTool(name);
+  const el = $("#holder .anno-canvas");
+  if (el) el.classList.toggle("select", name === "select");
+  const lassoChk = $("#line-annotation-tool");
+  if (lassoChk) lassoChk.checked = name === "line-lasso";
+}
+
+window.addEventListener("keydown", (e) => {
+  if (!canvas || !e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+  const key = e.key.toLowerCase();
+  // Shift+Z is a TOGGLE (on -> off -> on), unlike A/S/D which always select
+  // their tool outright -- matches the "Line annotation" checkbox's own
+  // on/off nature rather than the exclusive Select/Box/Polygon tool group.
+  if (key === "z") { e.preventDefault(); selectTool(canvas.tool === "line-lasso" ? "select" : "line-lasso"); return; }
+  const map = { a: "select", s: "bbox", d: "polygon" };
+  if (map[key]) { e.preventDefault(); selectTool(map[key]); }
+});
+
+// Ctrl/Cmd+S saves, same as clicking the Save button. Always prevents the
+// browser's own "Save Page As" dialog, and -- like Ctrl+Z elsewhere in this
+// app -- fires even while a floating input (label editor, line chip) has
+// focus, since no text field here has any legitimate use for a literal
+// Ctrl/Cmd+S chord. A no-op outside the workspace (no #save button exists
+// on the join/claim screens).
+window.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "s") return;
+  e.preventDefault();
+  const btn = $("#save");
+  if (btn && !btn.disabled) btn.click();
+});
+
+function loadIdentity() {
+  try { const v = JSON.parse(localStorage.getItem(TOKEN_KEY)); return v && v.token ? v : null; }
+  catch { return null; }
+}
+
+async function api(path, opts = {}) {
+  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  if (identity) headers["x-user-token"] = identity.token;
+  const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401) { localStorage.removeItem(TOKEN_KEY); identity = null; renderJoin("Your session expired. Enter your name again."); throw new Error("unauthorized"); }
+  return res;
+}
+
+function setWho() {
+  $("#who").textContent = identity ? identity.user.name : "";
+  $("#switch-user").hidden = !identity;
+}
+
+// ---------------- screens ----------------
+function renderJoin(error) {
+  if (canvas) { canvas.destroy(); canvas = null; }
+  document.querySelectorAll(".kbd-tooltip").forEach((el) => el.remove());
+  clearImageMeta();
+  app.innerHTML = `
+    <div class="center-screen">
+      <form id="join" class="card" style="width: 336px; padding: 22px;">
+        <h1 style="margin-bottom: 4px;">Welcome</h1>
+        <p class="muted" style="margin-bottom: 14px;">Enter your name to start labeling.</p>
+        ${error ? `<div class="notice err" style="margin-bottom: 10px;">${error}</div>` : ""}
+        <input class="input" name="name" maxlength="60" required autofocus placeholder="e.g. Priya Sharma" />
+        <button class="btn primary" style="width: 100%; margin-top: 12px;">Continue</button>
+        <p class="faint" style="text-align:center; margin-top: 10px;">No password needed — we'll remember you on this device.</p>
+      </form>
+    </div>`;
+  $("#join").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = new FormData(e.target).get("name").trim();
+    if (!name) return;
+    const res = await fetch("/api/join", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    const data = await res.json();
+    if (!res.ok) return renderJoin(data.error || "Something went wrong");
+    identity = { token: data.token, user: data.user };
+    localStorage.setItem(TOKEN_KEY, JSON.stringify(identity));
+    setWho();
+    boot();
+  });
+}
+
+function renderNoProject() {
+  if (canvas) { canvas.destroy(); canvas = null; }
+  document.querySelectorAll(".kbd-tooltip").forEach((el) => el.remove());
+  clearImageMeta();
+  app.innerHTML = `
+    <div class="center-screen">
+      <div class="card" style="width: 400px; padding: 26px; text-align: center;">
+        <h1 style="margin-bottom: 6px;">No active project</h1>
+        <p class="muted">The admin hasn't set up a project yet. Check back in a moment.</p>
+        <button id="retry" class="btn" style="margin-top: 14px;">Refresh</button>
+      </div>
+    </div>`;
+  $("#retry").addEventListener("click", boot);
+}
+
+function renderClaimScreen(message) {
+  if (canvas) { canvas.destroy(); canvas = null; }
+  document.querySelectorAll(".kbd-tooltip").forEach((el) => el.remove());
+  clearImageMeta();
+  const s = project.stats;
+  app.innerHTML = `
+    <div class="center-screen">
+      <div class="card" style="width: 420px; padding: 26px; text-align: center;">
+        <h1 style="margin-bottom: 4px;">${escHtml(project.project.name)}</h1>
+        ${message ? `<div class="notice info" style="margin: 10px 0;">${message}</div>` : ""}
+        <p class="muted" style="margin-bottom: 12px;">Claim the next unclaimed page to start annotating.</p>
+        <div class="row" style="justify-content: center; margin-bottom: 16px;">
+          <span class="badge gray">${s.total} total</span>
+          <span class="badge gray">${s.unclaimed} unclaimed</span>
+          <span class="badge amber">${s.claimed} in progress</span>
+          <span class="badge green">${s.completed} completed</span>
+        </div>
+        <button id="claim" class="btn primary">Claim next page</button>
+      </div>
+    </div>`;
+  $("#claim").addEventListener("click", claimNext);
+}
+
+async function claimNext() {
+  const res = await api("/api/claim", { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) return renderClaimScreen(data.error);
+  if (!data.image) return renderClaimScreen("No pages are available right now — everything is claimed or completed.");
+  currentImage = data.image;
+  renderWorkspace(data.resumed);
+}
+
+function clearImageMeta() {
+  const el = $("#image-meta");
+  if (!el) return;
+  el.style.display = "none";
+  $("#meta-inline").innerHTML = "";
+  $("#meta-dropdown").innerHTML = "";
+}
+
+function setImageMeta(image) {
+  const el = $("#image-meta");
+  if (!el) return;
+  el.style.display = "inline-flex";
+  const html = `
+    <span class="topbar-file" title="${escAttr(image.fileName)}">${escHtml(image.fileName)}</span>
+    <span class="faint"><span id="dims">${image.width}×${image.height}</span> · <span id="shape-count"></span> · <span id="save-state" class="muted"></span></span>
+    ${image.importedFrom ? `<span class="faint" style="color:var(--amber);">Pre-labeled from ${escHtml(image.importedFrom)}</span>` : ""}
+  `;
+  $("#meta-inline").innerHTML = html;
+  $("#meta-dropdown").innerHTML = html;
+}
+
+const SHORTCUTS_HTML = `
+  <div class="section-title" style="margin-bottom:6px;">Shortcuts</div>
+  <ul class="kbd-list">
+    <li><kbd>Shift</kbd>+<kbd>A</kbd> Select tool</li>
+    <li><kbd>Shift</kbd>+<kbd>S</kbd> Box tool</li>
+    <li><kbd>Shift</kbd>+<kbd>D</kbd> Polygon tool</li>
+    <li><kbd>Shift</kbd>+<kbd>Z</kbd> Toggle line annotation tool</li>
+    <li><kbd>Ctrl</kbd>+scroll Zoom</li>
+    <li>Scroll Pan (vertical)</li>
+    <li><kbd>Shift</kbd>+scroll Pan (horizontal)</li>
+    <li><kbd>Del</kbd> Remove shape</li>
+    <li><kbd>Ctrl</kbd>+<kbd>S</kbd> Save</li>
+    <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> Undo</li>
+    <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> Redo</li>
+    <li><kbd>Esc</kbd> Cancel drawing</li>
+    <li><kbd>Enter</kbd> Finish polygon</li>
+  </ul>`;
+
+function wireKbdTrigger() {
+  const trigger = $("#kbd-trigger");
+  if (!trigger) return;
+  let tooltip = null;
+  let hideTimer = null;
+
+  function removeTooltip() {
+    if (tooltip) { tooltip.remove(); tooltip = null; }
+  }
+
+  trigger.addEventListener("mouseenter", () => {
+    clearTimeout(hideTimer);
+    if (!tooltip) {
+      tooltip = document.createElement("div");
+      tooltip.className = "kbd-tooltip";
+      tooltip.innerHTML = SHORTCUTS_HTML;
+      tooltip.style.visibility = "hidden";
+      tooltip.style.display = "block";
+      document.body.appendChild(tooltip);
+      const tr = trigger.getBoundingClientRect();
+      const tt = tooltip.getBoundingClientRect();
+      let left = tr.left + tr.width / 2 - tt.width / 2;
+      let top = tr.top - tt.height - 8;
+      if (left < 8) left = 8;
+      if (left + tt.width > window.innerWidth - 8) left = window.innerWidth - tt.width - 8;
+      if (top < 8) top = tr.bottom + 8;
+      if (top + tt.height > window.innerHeight - 8) top = tr.top - tt.height - 8;
+      tooltip.style.left = left + "px";
+      tooltip.style.top = top + "px";
+      tooltip.style.visibility = "";
+      tooltip.classList.add("show");
+      tooltip.addEventListener("mouseenter", () => clearTimeout(hideTimer));
+      tooltip.addEventListener("mouseleave", () => { hideTimer = setTimeout(removeTooltip, 300); });
+    }
+  });
+
+  trigger.addEventListener("mouseleave", () => {
+    hideTimer = setTimeout(removeTooltip, 300);
+  });
+}
+
+// ---------------- workspace ----------------
+function renderWorkspace(resumed) {
+  if (canvas) { canvas.destroy(); canvas = null; }
+  document.querySelectorAll(".kbd-tooltip").forEach((el) => el.remove());
+  app.innerHTML = `
+    <div class="workspace">
+      <aside class="side">
+        ${resumed ? `<div class="notice info" style="margin-bottom:8px; font-size:12px;">Resumed your in-progress page. Save &amp; complete it to claim the next one.</div>` : ""}
+        <div class="tight-stack">
+          <button id="save" class="btn" style="width:100%">Save (sync to admin)</button>
+          <button id="complete" class="btn primary" style="width:100%">Save &amp; Mark Complete</button>
+          <div class="export-grid">
+            <button id="download-json" class="btn sm">⬇ JSON</button>
+            <button id="download-xml" class="btn sm">⬇ XML</button>
+            <button id="download-voc" class="btn sm">⬇ VOC</button>
+            <button id="download-coco" class="btn sm">⬇ COCO</button>
+            <button id="download-yolo" class="btn sm">⬇ YOLO</button>
+          </div>
+        </div>
+        <div>
+          <div class="section-title">Tools</div>
+          <div class="tools">
+            <button class="btn sm active" data-tool="select">Select<span class="kbd-badge">⇧<span class="kbd-key">+A</span></span></button>
+            <button class="btn sm" data-tool="bbox">Box<span class="kbd-badge">⇧<span class="kbd-key">+S</span></span></button>
+            <button class="btn sm" data-tool="polygon">Polygon<span class="kbd-badge">⇧<span class="kbd-key">+D</span></span></button>
+          </div>
+          <p class="faint" style="margin-top:6px;">Draw a shape — a small box asks you to name it. Names become labels for everyone.</p>
+        </div>
+        <div class="stack" style="margin-top:0;">
+          <label class="row toggle-row" title="Draw a freeform loop over several shapes to give them all the same line number -- fixes line numbers on a skewed page where the automatic top-to-bottom grouping guesses wrong">
+            <input type="checkbox" id="line-annotation-tool" />
+            <span>Line annotation<span class="kbd-badge">⇧<span class="kbd-key">+Z</span></span></span>
+          </label>
+          <label class="row toggle-row">
+            <input type="checkbox" id="show-line-numbers" />
+            <span>Show line &amp; sequence numbers</span>
+          </label>
+          <label class="row toggle-row">
+            <input type="checkbox" id="show-label-input" />
+            <span>Show label input box</span>
+          </label>
+          <button type="button" id="recalc-lines" class="btn sm" style="width:100%;" title="Clear every manual or pre-annotation line number on this page and reapply the tool's own automatic top-to-bottom numbering (any line-annotation regions you've drawn stay in effect). Undoable with Ctrl/Cmd+Z.">
+            <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Recalculate lines
+          </button>
+        </div>
+        <div>
+          <div class="row" style="justify-content:space-between;">
+            <div class="section-title" style="margin-bottom:0;">Labels</div>
+            <input id="labeler-label-search" class="input side-search" placeholder="Filter…" />
+          </div>
+          <div id="labels" class="label-list"></div>
+        </div>
+        <div>
+          <div class="row" style="justify-content:space-between;">
+            <div class="section-title" style="margin-bottom:0;">Shapes</div>
+            <input id="labeler-shape-search" class="input side-search" placeholder="Filter…" />
+          </div>
+          <div id="shapes" class="shape-list"></div>
+        </div>
+      </aside>
+      <div class="canvas-wrap">
+        <div id="holder" class="canvas-holder"></div>
+        <button id="kbd-trigger" class="kbd-canvas-btn" type="button">⌨</button>
+      </div>
+    </div>`;
+
+  arrangeWorkspace();
+  canvas = new AnnotationCanvas($("#holder"), {
+    getLabels: () => labels,
+    createLabel: async (name) => {
+      const res = await api("/api/labels", { method: "POST", body: JSON.stringify({ name }) });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!labels.some((l) => l.id === data.label.id)) labels.push(data.label);
+      renderLabels();
+      return data.label;
+    },
+    onChange: () => { refreshMeta(); renderShapesList(); },
+  });
+  canvas.load(`/api/image/${currentImage.id}/file`, currentImage.width, currentImage.height, currentImage.annotations, currentImage.lineRegions);
+  $("#holder .anno-canvas").classList.add("select");
+
+  document.querySelectorAll("[data-tool]").forEach((b) => {
+    b.addEventListener("click", () => selectTool(b.dataset.tool));
+  });
+  const lineAnnoChk = $("#line-annotation-tool");
+  lineAnnoChk.addEventListener("change", () => selectTool(lineAnnoChk.checked ? "line-lasso" : "select"));
+  const showLinesChk = $("#show-line-numbers");
+  showLinesChk.checked = canvas.showLineNumbers;
+  showLinesChk.addEventListener("change", () => canvas.setShowLineNumbers(showLinesChk.checked));
+  const showLabelInputChk = $("#show-label-input");
+  showLabelInputChk.checked = canvas.showLabelInput;
+  showLabelInputChk.addEventListener("change", () => canvas.setShowLabelInput(showLabelInputChk.checked));
+
+  $("#save").addEventListener("click", () => saveWork(false));
+  $("#complete").addEventListener("click", () => saveWork(true));
+  $("#recalc-lines").addEventListener("click", () => {
+    const n = canvas.countManualLineOverrides();
+    if (!n) { showToast("Every shape on this page is already automatic — nothing to recalculate."); return; }
+    if (!confirm(`Recalculate line & sequence numbers for this page?\n\nThis clears ${n} manual or pre-annotation line number${n === 1 ? "" : "s"} and reapplies the tool's automatic top-to-bottom numbering. Any line-annotation regions you've drawn stay in effect. You can undo this with Ctrl/Cmd+Z.`)) return;
+    canvas.resetAllLines();
+    showToast("Line numbers recalculated");
+  });
+  ["json", "xml", "voc", "coco", "yolo"].forEach((fmt) => {
+    $(`#download-${fmt}`).addEventListener("click", () => downloadExport(fmt));
+  });
+  const labelerLabelSearch = $("#labeler-label-search");
+  if (labelerLabelSearch) labelerLabelSearch.addEventListener("input", () => renderLabels());
+  const labelerShapeSearch = $("#labeler-shape-search");
+  if (labelerShapeSearch) labelerShapeSearch.addEventListener("input", () => renderShapesList());
+
+  wireKbdTrigger();
+  setImageMeta(currentImage);
+  renderLabels();
+  renderShapesList();
+  refreshMeta();
+}
+
+function renderShapesList() {
+  const el = $("#shapes");
+  if (!el || !canvas) return;
+  const searchInput = $("#labeler-shape-search");
+  const q = searchInput ? searchInput.value.toLowerCase() : "";
+  const shapes = canvas.getShapesSummary();
+  const filtered = q ? shapes.filter((s) => `L${s.line}-${s.seq} ${(s.labelName || "Unlabeled")}`.toLowerCase().includes(q)) : shapes;
+  el.innerHTML = filtered.length ? filtered.map((s) =>
+    `<div class="shape-item ${s.id === canvas.selectedId ? "active" : ""}">
+       <button type="button" class="shape-item-main" data-id="${s.id}">
+         <span class="tag">L${s.line}-${s.seq}</span>
+         <span class="swatch" style="background:${s.color}"></span>
+         <span class="name">${escHtml(s.labelName || "Unlabeled")}</span>
+       </button>
+       <button type="button" class="shape-item-del" data-del="${s.id}" title="Delete this shape">×</button>
+     </div>`).join("") : `<p class="faint">${q ? "No shapes match." : "No shapes yet — draw a box or polygon."}</p>`;
+  el.querySelectorAll(".shape-item-main").forEach((b) => b.addEventListener("click", () => canvas.selectAnnotation(b.dataset.id)));
+  el.querySelectorAll(".shape-item-del").forEach((b) => b.addEventListener("click", () => canvas.deleteAnnotation(b.dataset.del)));
+}
+
+function renderLabels() {
+  const el = $("#labels");
+  if (!el) return;
+  const searchInput = $("#labeler-label-search");
+  const q = searchInput ? searchInput.value.toLowerCase() : "";
+  const filtered = q ? labels.filter((l) => l.name.toLowerCase().includes(q)) : labels;
+  const highlightId = canvas ? canvas.highlightLabelId : null;
+  // No delete cross here on purpose: labelers only have a route to CREATE
+  // labels (POST /api/labels), not delete them -- deleting a label unassigns
+  // it from every image project-wide, which is an admin-only action (see
+  // admin.js's version of this same list for that side of it).
+  el.innerHTML = filtered.length ? filtered.map((l) =>
+    `<div class="label-item ${highlightId === l.id ? "active" : ""}">
+       <button type="button" class="label-item-main" data-id="${l.id}" title="Click to highlight every shape with this label on the canvas">
+         <span class="swatch" style="background:${l.color}"></span><span class="grow">${escHtml(l.name)}</span>
+       </button>
+     </div>`).join("") :
+    `<p class="faint">${q ? "No labels match." : "No labels yet — draw a shape and name it to create one."}</p>`;
+  el.querySelectorAll(".label-item-main").forEach((b) => {
+    b.addEventListener("click", () => {
+      canvas.setActiveLabel(b.dataset.id);
+      canvas.toggleHighlightLabel(b.dataset.id);
+      renderLabels();
+    });
+  });
+}
+
+function refreshMeta() {
+  const el = $("#shape-count");
+  if (el && canvas) el.textContent = `${canvas.getAnnotations().length} shapes`;
+  const s = $("#save-state");
+  if (s && canvas) {
+    s.textContent = canvas.isDirty() ? "unsaved changes" : "saved";
+    s.style.color = canvas.isDirty() ? "var(--amber)" : "var(--green)";
+  }
+}
+
+async function saveWork(complete) {
+  return runWorkspaceTask(canvas, () => persistWork(complete));
+}
+async function persistWork(complete) {
+  const anns = canvas.getAnnotations();
+  if (complete) {
+    const unlabeled = anns.filter((a) => !a.labelId).length;
+    if (unlabeled && !confirm(`${unlabeled} shape(s) have no label. Complete anyway?`)) return;
+  }
+  const res = await api(`/api/image/${currentImage.id}/${complete ? "complete" : "save"}`, {
+    method: "POST",
+    body: JSON.stringify({ annotations: anns, lineRegions: canvas.getLineRegions() }),
+  });
+  const data = await res.json();
+  if (!res.ok) { showToast(data.error || "Save failed", { type: "error" }); return; }
+  canvas.markSaved();
+  refreshMeta();
+  showToast(complete ? "Saved & marked complete" : "Saved");
+  if (complete) {
+    currentImage = null;
+    await refreshProject();
+    renderClaimScreen("Page completed. Claim the next one when ready.");
+  }
+}
+
+// The server's actual file extension per format -- "yolo" downloads a small
+// zip (the .txt needs its classes.txt alongside to mean anything), not a
+// bare .txt, so it can't just reuse the format name like the others can.
+const EXPORT_EXT = { json: "json", xml: "xml", voc: "xml", coco: "json", yolo: "zip" };
+
+// json/xml are this app's own formats and support a coordinate-system
+// choice (normalized/pixel/both) -- ask before downloading. voc/coco/yolo
+// each have exactly one coordinate convention fixed by their own spec, so
+// the question would be pointless (or actively misleading) for those.
+async function downloadExport(format) {
+  // Export always reads from the server's last-saved copy, never straight
+  // off the canvas -- so unsaved edits here would silently export stale
+  // numbers. askUnsavedChanges shows exactly what's unsaved (and where) and
+  // lets you save first instead of finding out after the fact.
+  if (canvas.isDirty()) {
+    const decision = await askUnsavedChanges(canvas);
+    if (decision === "cancel") return;
+    if (decision === "save") {
+      await saveWork(false);
+      if (canvas.isDirty()) return; // save failed -- saveWork already toasted the error
+    }
+  }
+  let coords = null;
+  if (format === "json" || format === "xml") {
+    coords = await askExportCoords();
+    if (!coords) return; // cancelled
+  }
+  const qs = coords ? `?coords=${coords}` : "";
+  const res = await api(`/api/image/${currentImage.id}/export/${format}${qs}`);
+  if (!res.ok) return;
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const base = currentImage.fileName.split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
+  a.download = `${base}.${EXPORT_EXT[format] || format}`;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// Manual-save model: warn before losing unsaved work.
+window.addEventListener("beforeunload", (e) => {
+  if (canvas && canvas.isDirty()) { e.preventDefault(); e.returnValue = ""; }
+});
+
+// ---------------- boot ----------------
+async function refreshProject() {
+  const res = await fetch("/api/project");
+  project = await res.json();
+}
+
+async function boot() {
+  setWho();
+  if (!identity) return renderJoin();
+  try {
+    const me = await api("/api/me");
+    if (!me.ok) return;
+    await refreshProject();
+    if (!project.project) return renderNoProject();
+    labels = project.project.labels;
+    await claimNext(); // resumes an in-progress claim automatically
+  } catch (err) {
+    if (err.message !== "unauthorized") renderJoin("Could not reach the server. Try again.");
+  }
+}
+
+$("#switch-user").addEventListener("click", () => {
+  if (canvas && canvas.isDirty() && !confirm("You have unsaved changes. Switch user anyway?")) return;
+  localStorage.removeItem(TOKEN_KEY);
+  identity = null;
+  setWho();
+  renderJoin();
+});
+
+identity = loadIdentity();
+boot();

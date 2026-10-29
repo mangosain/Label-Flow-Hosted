@@ -1,0 +1,211 @@
+# LabelFlow
+
+A self-hosted tool for collaboratively annotating images with bounding boxes,
+polygons, and reading-order line regions. Version 1.1 adds a compact workspace,
+real disk-backed thumbnails, explicit editor cleanup, and incremental saves.
+
+## Start
+
+Requires **Node.js 20.9 or newer**. From this folder:
+
+```sh
+npm ci
+npm start
+```
+
+There is no frontend build step or database server. Sharp generates small image
+previews; bmp-js supports BMP previews in an isolated worker. The lockfile pins
+the dependencies. This replaces the original version's zero-install setup.
+
+For existing projects, stop the old server, back up the complete `state/` folder,
+and keep that folder alongside this version's `server.js`. Existing projects
+load automatically. Dataset folders remain where they are; originals are never
+modified. Start from the same working directory as before.
+
+See [AUDIT.md](AUDIT.md) for the feature map, measured checks, tradeoffs, and
+remaining limits. Run `npm test` for the backend regression suite.
+
+## Why two ports
+
+LabelFlow's access model is the network, not a login screen.
+
+| Listener | Port | Reachable from | Who it's for |
+|---|---|---|---|
+| LAN | Next free port after the admin port (auto-picked) | Anyone on your local network | Labelers — join with just a name |
+| Admin | You choose at startup (default `3001`) | This machine only (loopback) | Whoever is sitting at this computer |
+
+The admin port refuses connections from anywhere but `localhost`, so there's
+no password to manage — physical/network access to the admin machine *is*
+the permission. Labelers get a lightweight name-based identity (no
+password) scoped to the LAN port only; they can never reach `/admin*` or
+`/api/admin/*` routes, even if they guess the URL.
+
+## Features
+
+- **Bounding boxes and polygons**, drawn, selected, moved, and resized
+  directly on an HTML canvas — no framework, no build step.
+- **Automatic line & sequence numbering.** Shapes are grouped into reading
+  "lines" by vertical position and numbered left-to-right within each line
+  (`L2-3` = line 2, 3rd shape), with a manual override when the automatic
+  grouping guesses wrong. Numbers are recomputed fresh every time, from
+  whatever shapes currently exist — delete one and everything renumbers
+  itself.
+- **Multi-user collaboration.** Labelers claim an image, annotate it, and
+  save — work syncs to the admin the moment Save is pressed (not
+  autosaved continuously, by design, so "saved" always means something).
+- **Multi-project support.** Create, switch between, unload, or
+  permanently delete projects from the admin dashboard. Deleting a
+  project only removes this app's own tracking data — your dataset and
+  annotation files on disk are never touched.
+- **Pre-annotation import.** Point at a folder of images and, optionally,
+  a separate folder of existing labels — they're matched by filename and
+  loaded as ordinary, fully editable shapes. See [Importing](#importing-pre-annotations) below for supported formats.
+- **Export to 5 formats**, barebones by design — just the page and the
+  shapes on it, nothing else. See [Exporting](#exporting) below.
+- Undo/redo, zoom (`Ctrl`+scroll), pan (scroll, or `Shift`+scroll for
+  horizontal), keyboard shortcuts for every tool, label autocomplete with
+  per-browser history, and a live shapes/labels sidebar for
+  jumping straight to any box or polygon.
+
+## Quick start
+
+1. **Start the server** from the project folder:
+   ```
+   npm ci
+   node server.js
+   ```
+   You'll be asked which port to run the admin panel on (just press
+   Enter to accept the default, `3001`); if that port's already taken
+   you'll be asked again. The labeler/LAN listener isn't something you're
+   asked about — it's picked automatically, starting from the next port
+   after the admin one and scanning forward until a free one is found.
+
+   Running non-interactively (piped stdin, a process manager, Docker, CI)
+   skips the prompt entirely — the admin port falls back to `3001` unless
+   you set the `ADMIN_PORT` environment variable, and the LAN port is
+   still auto-picked unless you set `PORT`. Both environment variables,
+   when set, always take priority over the prompt/auto-detection either
+   way.
+2. **Open the admin panel** on the host machine at whichever URL is
+   printed on startup (`http://localhost:<admin port>`). Create a
+   project, then upload a dataset (a folder of images) and, optionally, a
+   separate folder of pre-existing annotations.
+3. **Share the LAN URL** the server prints on startup with your labelers.
+   They open it in a browser, type their name, and start claiming pages.
+
+No accounts, no database setup, no dependencies to install.
+
+## Importing pre-annotations
+
+Pointing the admin dataset-upload panel at a folder of images will, if you
+also give it an annotations folder, automatically match files to images by
+filename (ignoring subfolders) and load whatever it finds as normal,
+editable shapes. Supported formats, auto-detected per file:
+
+- **Pascal VOC XML** (`<object><bndbox>`, with an optional `<polygon>`
+  extension and manual `<line>` override)
+- **LabelFlow's own JSON/XML** (round-trips its own exports losslessly)
+- **LabelMe JSON** (`{shapes:[{shape_type, points, label}]}`)
+- **COCO JSON** — one manifest for the whole dataset, matched by `file_name`
+- **YOLO `.txt`** — normalized `class_id cx cy w h` per line, reading class
+  names from `classes.txt` / `obj.names` / `data.yaml`
+- **Raw detector/OCR output** (`{boxes:[{bbox, confidence}]}`) — imported as
+  unlabeled boxes for a human to name, since detector output has no class
+  names
+
+Re-running an import is always safe: brand-new images are added, and any
+already-uploaded image with zero shapes gets backfilled, but an image that
+already has shapes — imported earlier or hand-drawn — is never touched or
+overwritten.
+
+## Exporting
+
+Every format exports just two things: the page (filename, width, height)
+and the shapes on it (type, line/sequence number, label, coordinates) — no
+project metadata, timestamps, status, or internal ids.
+
+| Format | Coordinates | Notes |
+|---|---|---|
+| JSON | your choice: normalized, pixel, or both | LabelFlow's own schema; round-trips back in as a pre-annotation import |
+| XML | your choice: normalized, pixel, or both | Same content as JSON, in XML form |
+| Pascal VOC | pixel (fixed by spec) | Strict, standard VOC — no custom elements, so any VOC tool reads it. Polygons degrade to their bounding box (VOC has no polygon concept) |
+| COCO | pixel (fixed by spec) | One combined manifest (not per-image files), as COCO expects. Carries `line`/`sequence` too, since COCO has room for extra keys |
+| YOLO | normalized (fixed by spec) | `class_id cx cy w h` per line, plus a shared `classes.txt`. Can't carry line/sequence — every real YOLO reader expects an exact fixed token count per line |
+
+JSON and XML ask which coordinate system to include before downloading,
+since they're the two formats LabelFlow fully controls. VOC/COCO/YOLO each
+have exactly one valid coordinate convention by their own spec, so there's
+nothing to ask.
+
+Downloads are available per-image or in bulk (every image in the project).
+Bulk exports can be filtered to completed images only, or every image that
+currently has any shapes at all.
+
+## Project structure
+
+```
+server.js       Two HTTP listeners (LAN + admin), all API routes
+lib/            Server-side logic: storage, import, export, image sizing, zip/dialog helpers
+public/         Browser-side: the labeler workspace, admin dashboard, and the shared canvas engine
+```
+
+Runtime data (projects, images, annotations) is written to `./state`
+relative to wherever `node server.js` is run from — see `.gitignore`.
+
+## Storage and recovery
+
+- `state/projects/<id>/images.json`: full checkpoint of image records.
+- `state/projects/<id>/updates/<image-id>.json`: newer atomic record updates,
+  replayed over the checkpoint when a project is loaded.
+- Imports and project-wide label deletion consolidate those updates into the
+  checkpoint. Saves and claims write only the affected record.
+- `state/backups/`: existing rotating backups now include the updates folder.
+- `state/thumbnails/`: disposable WebP previews; never annotation data. Stop the
+  server before manually deleting this folder. Previews regenerate on demand.
+
+**Keep the entire state directory together.** Copying only `images.json` or
+running an older version against updated state can omit newer record updates.
+The API/export commands resolve checkpoint + updates correctly. Automatic backups
+are convenience snapshots, not a replacement for independent backups.
+
+## Performance defaults
+
+- 36 image cards per gallery page; only viewport-adjacent thumbnails have sources.
+- Previews fit within 320 × 240 pixels; originals load only in the editor.
+- Two simultaneous preview-generation jobs, up to 64 queued jobs, one native
+  processing thread per image, and no retained Sharp operation cache.
+- On-disk thumbnail cache pruned toward 256 MiB at most once per minute during
+  generation. The cap is a periodic target, not a hard instantaneous limit.
+- Standard preview pixel ceiling: 100 million pixels. BMP preview ceiling:
+  16 million pixels and 64 MiB input. Oversized/unsupported previews show a
+  placeholder; opening the original remains available.
+- Undo history: up to 100 snapshots, trimmed against an estimated 16 MiB serialized
+  budget per stack, always retaining at least the newest snapshot. Actual heap
+  usage differs from this estimate.
+
+These defaults bound browsing work independently of dataset image count. The
+active project's metadata and saved annotation objects still reside in server
+memory. See the audit for database/tiling alternatives for more demanding loads.
+
+## Requirements and tests
+
+Node.js 20.9+; npm; a browser with Canvas, ResizeObserver, IntersectionObserver,
+CSS Grid, and `inert` support. Tested in Chromium 134, Node.js 24.22.1 on Linux.
+
+```sh
+npm test
+```
+
+The test suite creates isolated temporary state and exercises a synthetic
+10,000-record project, save/restart/checkpoint recovery, image previews, import
+backfill, access separation, and streamed export equivalence.
+
+Optional browser smoke test (not needed to run the app):
+
+```sh
+npm install --no-save --package-lock=false playwright
+npx playwright install chromium
+node test/browser-smoke.cjs
+```
+
+Use `BROWSER_EXECUTABLE` to choose an already-installed Chromium executable.
